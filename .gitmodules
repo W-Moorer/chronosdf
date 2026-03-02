@@ -1,0 +1,16 @@
+[submodule "src/chrono_thirdparty/googletest"]
+	path = src/chrono_thirdparty/googletest
+	url = https://github.com/google/googletest.git
+[submodule "src/chrono_thirdparty/googlebenchmark"]
+	path = src/chrono_thirdparty/googlebenchmark
+	url = https://github.com/google/benchmark.git
+[submodule "src/chrono_thirdparty/flatbuffers"]
+	path = src/chrono_thirdparty/flatbuffers
+	url = https://github.com/google/flatbuffers.git
+[submodule "src/chrono_thirdparty/fmu-forge"]
+	path = src/chrono_thirdparty/fmu-forge
+	url = https://github.com/projectchrono/fmu-forge.git
+[submodule "src/chrono_thirdparty/HydroChrono"]
+	path = src/chrono_thirdparty/HydroChrono
+	url = https://github.com/Project-SEA-Stack/HydroChrono.git
+	branch = feature/chrono-fsi-interface
