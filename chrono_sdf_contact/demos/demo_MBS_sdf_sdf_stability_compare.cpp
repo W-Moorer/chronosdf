@@ -131,6 +131,17 @@ struct RunResult {
     bool exploded = false;
 };
 
+struct TrajectoryRow {
+    std::string mode;
+    double step_size = 0.0;
+    int step = 0;
+    double time = 0.0;
+    int body_id = 0;
+    double com_x = 0.0;
+    double com_y = 0.0;
+    double com_z = 0.0;
+};
+
 double ComputeBodyMechanicalEnergy(chrono::ChBody* body, const chrono::ChVector3d& gravity_acc) {
     if (!body) {
         return 0.0;
@@ -148,6 +159,7 @@ double ComputeBodyMechanicalEnergy(chrono::ChBody* body, const chrono::ChVector3
 
 struct StabilityConfig {
     std::string csv_path = "sdf_sdf_stability_compare.csv";
+    std::string trajectory_csv_path;
     double duration = 1.5;
     std::vector<double> step_sizes = {1e-3, 2e-3, 4e-3};
     std::size_t kmax = 64;
@@ -228,7 +240,8 @@ bool ParseStepSizes(const std::string& text, std::vector<double>& out_steps) {
 
 void PrintUsage(const char* exe_name) {
     std::cout << "Usage: " << exe_name
-              << " [--csv <path>] [--duration <seconds>] [--dts <h1,h2,...>] [--kmax <int>] [--cell-size <meters>]"
+              << " [--csv <path>] [--trajectory-csv <path>] [--duration <seconds>] [--dts <h1,h2,...>]"
+                 " [--kmax <int>] [--cell-size <meters>]"
                  " [--octree-eps-force <double>] [--octree-max-depth <int>] [--octree-c-error <double>]"
                  " [--octree-band <double>] [--octree-margin <double>] [--seed <u64>]\n";
 }
@@ -266,6 +279,15 @@ bool ParseArgs(int argc, char* argv[], StabilityConfig& cfg) {
                 return false;
             }
             cfg.csv_path = val;
+            continue;
+        }
+
+        if (arg == "--trajectory-csv") {
+            const auto* val = need_value("--trajectory-csv");
+            if (!val) {
+                return false;
+            }
+            cfg.trajectory_csv_path = val;
             continue;
         }
 
@@ -399,7 +421,8 @@ RunResult RunCase(chrono_sdf_contact::SdfSdfSamplingMode sampling_mode,
                   const StabilityConfig& cfg,
                   bool clustering_enabled,
                   bool octree_enabled,
-                  std::uint64_t seed) {
+                  std::uint64_t seed,
+                  std::vector<TrajectoryRow>* trajectory_rows) {
     using namespace chrono;
     using namespace chrono_sdf_contact;
 
@@ -467,6 +490,10 @@ RunResult RunCase(chrono_sdf_contact::SdfSdfSamplingMode sampling_mode,
     unsigned int max_contacts = 0;
     unsigned long long total_contacts = 0;
     bool exploded = false;
+    if (trajectory_rows) {
+        const auto p = top->GetPos();
+        trajectory_rows->push_back({mode_name, step_size, 0, 0.0, 0, p.x(), p.y(), p.z()});
+    }
 
     const auto t0 = std::chrono::high_resolution_clock::now();
     for (int step = 0; step < num_steps; ++step) {
@@ -477,6 +504,10 @@ RunResult RunCase(chrono_sdf_contact::SdfSdfSamplingMode sampling_mode,
         if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z()) || std::abs(pos.y()) > 2.0) {
             exploded = true;
             break;
+        }
+        if (trajectory_rows) {
+            trajectory_rows->push_back({mode_name, step_size, step + 1, (step + 1) * step_size, 0, pos.x(), pos.y(),
+                                        pos.z()});
         }
 
         min_height = std::min(min_height, pos.y());
@@ -512,6 +543,18 @@ RunResult RunCase(chrono_sdf_contact::SdfSdfSamplingMode sampling_mode,
     out.octree_enabled = octree_enabled;
     out.exploded = exploded;
     return out;
+}
+
+void WriteTrajectoryCsv(const std::string& path, const std::vector<TrajectoryRow>& rows) {
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        throw std::runtime_error("Failed to open trajectory CSV file: " + path);
+    }
+    out << "mode,step_size,step,time,body_id,com_x,com_y,com_z\n";
+    for (const auto& r : rows) {
+        out << r.mode << "," << r.step_size << "," << r.step << "," << r.time << "," << r.body_id << "," << r.com_x
+            << "," << r.com_y << "," << r.com_z << "\n";
+    }
 }
 
 void WriteCsv(const std::string& path, const std::vector<RunResult>& results) {
@@ -573,11 +616,13 @@ int main(int argc, char* argv[]) {
         std::vector<RunResult> results;
         const auto mode_specs = BuildDefaultModeSpecs();
         results.reserve(cfg.step_sizes.size() * mode_specs.size());
+        std::vector<TrajectoryRow> trajectories;
 
         for (double dt : cfg.step_sizes) {
             for (const auto& mode : mode_specs) {
-                results.push_back(
-                    RunCase(mode.sampling_mode, mode.name, dt, cfg, mode.clustering_enabled, mode.octree_enabled, cfg.seed));
+                results.push_back(RunCase(mode.sampling_mode, mode.name, dt, cfg, mode.clustering_enabled,
+                                          mode.octree_enabled, cfg.seed,
+                                          cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
             }
         }
 
@@ -586,6 +631,10 @@ int main(int argc, char* argv[]) {
         }
         WriteCsv(cfg.csv_path, results);
         std::cout << "CSV written to: " << cfg.csv_path << std::endl;
+        if (!cfg.trajectory_csv_path.empty()) {
+            WriteTrajectoryCsv(cfg.trajectory_csv_path, trajectories);
+            std::cout << "Trajectory CSV written to: " << cfg.trajectory_csv_path << std::endl;
+        }
 
         bool any_bidir_contact = false;
         for (const auto& r : results) {

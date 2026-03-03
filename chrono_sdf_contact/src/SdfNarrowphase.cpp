@@ -23,9 +23,12 @@ namespace {
 constexpr std::size_t kMaxMeshTrianglesPerShape = 256;
 constexpr std::size_t kMaxBoundarySamples = 256;
 constexpr std::size_t kBoxDirectionalSamples = 8;
+constexpr std::size_t kBoxFaceSamples = 6;
 constexpr std::size_t kMaxMeshQueriesPerShape = 128;
 constexpr std::size_t kMaxQueriesPerModel = 512;
 constexpr double kMeshQueryCellSize = 0.04;
+// Clamp extreme one-shot penetration to avoid unstable impulses from outlier samples.
+constexpr double kMaxPenetrationDepth = 0.05;
 
 struct BodyPose {
     chrono::ChVector3d pos;
@@ -107,10 +110,17 @@ void AppendBoxBoundarySamples(const chrono::ChCollisionShapeInstance& instance,
         chrono::ChVector3d(-1.0, 1.0, -1.0),  chrono::ChVector3d(1.0, 1.0, -1.0),
         chrono::ChVector3d(-1.0, -1.0, 1.0),  chrono::ChVector3d(1.0, -1.0, 1.0),
         chrono::ChVector3d(-1.0, 1.0, 1.0),   chrono::ChVector3d(1.0, 1.0, 1.0)};
+    static const std::array<chrono::ChVector3d, kBoxFaceSamples> kFaceDirs = {
+        chrono::ChVector3d(1.0, 0.0, 0.0),  chrono::ChVector3d(-1.0, 0.0, 0.0), chrono::ChVector3d(0.0, 1.0, 0.0),
+        chrono::ChVector3d(0.0, -1.0, 0.0), chrono::ChVector3d(0.0, 0.0, 1.0),  chrono::ChVector3d(0.0, 0.0, -1.0)};
 
     AppendBoundarySample(out_samples, ToModelPoint(instance, chrono::VNULL));
 
     for (const auto& d : kDirs) {
+        const chrono::ChVector3d p_shape_local(d.x() * h.x(), d.y() * h.y(), d.z() * h.z());
+        AppendBoundarySample(out_samples, ToModelPoint(instance, p_shape_local));
+    }
+    for (const auto& d : kFaceDirs) {
         const chrono::ChVector3d p_shape_local(d.x() * h.x(), d.y() * h.y(), d.z() * h.z());
         AppendBoundarySample(out_samples, ToModelPoint(instance, p_shape_local));
     }
@@ -191,7 +201,7 @@ void AppendPointContact(const chrono::ChVector3d& pA_world,
         return;
     }
 
-    const double distance = sample.phi;
+    const double distance = std::max(sample.phi, -kMaxPenetrationDepth);
     if (distance >= 0.0) {
         return;
     }
@@ -205,7 +215,7 @@ void AppendPointContact(const chrono::ChVector3d& pA_world,
     const auto nB_world = sample.grad;
     cinfo.vN = -nB_world;  // respect to A, A->B
     cinfo.vpA = pA_world;
-    cinfo.vpB = pA_world - sample.phi * nB_world;
+    cinfo.vpB = pA_world - distance * nB_world;
     cinfo.distance = distance;
     cinfo.eff_radius = chrono::ChCollisionInfo::GetDefaultEffectiveCurvatureRadius();
     cinfo.reaction_cache = nullptr;
@@ -234,7 +244,7 @@ void AppendSphereContact(const chrono::ChVector3d& center_world,
         return;
     }
 
-    const double distance = sample.phi - radius;
+    const double distance = std::max(sample.phi - radius, -kMaxPenetrationDepth);
     if (distance >= 0.0) {
         return;
     }
@@ -248,7 +258,7 @@ void AppendSphereContact(const chrono::ChVector3d& center_world,
     const auto nB_world = sample.grad;
     cinfo.vN = -nB_world;  // respect to A, A->B
     cinfo.vpA = center_world + radius * cinfo.vN;
-    cinfo.vpB = center_world - sample.phi * nB_world;
+    cinfo.vpB = center_world - (distance + radius) * nB_world;
     cinfo.distance = distance;
     cinfo.eff_radius = chrono::ChCollisionInfo::GetDefaultEffectiveCurvatureRadius();
     cinfo.reaction_cache = nullptr;
@@ -275,6 +285,7 @@ void AppendSdfSdfContactAtoB(const chrono::ChVector3d& pA_world,
     if (sampleB.phi >= 0.0) {
         return;
     }
+    const double distance = std::max(sampleB.phi, -kMaxPenetrationDepth);
 
     chrono::ChCollisionInfo cinfo;
     cinfo.modelA = modelA;
@@ -283,8 +294,8 @@ void AppendSdfSdfContactAtoB(const chrono::ChVector3d& pA_world,
     cinfo.shapeB = nullptr;
     cinfo.vN = -sampleB.grad;
     cinfo.vpA = pA_world;
-    cinfo.vpB = pA_world - sampleB.phi * sampleB.grad;
-    cinfo.distance = sampleB.phi;
+    cinfo.vpB = pA_world - distance * sampleB.grad;
+    cinfo.distance = distance;
     cinfo.eff_radius = chrono::ChCollisionInfo::GetDefaultEffectiveCurvatureRadius();
     cinfo.reaction_cache = nullptr;
 
@@ -310,6 +321,7 @@ void AppendSdfSdfContactBtoA(const chrono::ChVector3d& pB_world,
     if (sampleA.phi >= 0.0) {
         return;
     }
+    const double distance = std::max(sampleA.phi, -kMaxPenetrationDepth);
 
     chrono::ChCollisionInfo cinfo;
     cinfo.modelA = modelA;
@@ -317,9 +329,9 @@ void AppendSdfSdfContactBtoA(const chrono::ChVector3d& pB_world,
     cinfo.shapeA = nullptr;
     cinfo.shapeB = nullptr;
     cinfo.vN = sampleA.grad;
-    cinfo.vpA = pB_world - sampleA.phi * sampleA.grad;
+    cinfo.vpA = pB_world - distance * sampleA.grad;
     cinfo.vpB = pB_world;
-    cinfo.distance = sampleA.phi;
+    cinfo.distance = distance;
     cinfo.eff_radius = chrono::ChCollisionInfo::GetDefaultEffectiveCurvatureRadius();
     cinfo.reaction_cache = nullptr;
 
@@ -374,6 +386,11 @@ const std::vector<chrono::ChVector3d>& SdfNarrowphase::GetBoundarySamplesCached(
         return proxy.boundary_samples_local;
     }
 
+    if (!cache_enabled_) {
+        BuildBoundarySamplesFromModel(model, boundary_samples_scratch_);
+        return boundary_samples_scratch_;
+    }
+
     auto it = boundary_samples_cache_.find(model);
     if (it != boundary_samples_cache_.end()) {
         return it->second;
@@ -386,11 +403,21 @@ const std::vector<chrono::ChVector3d>& SdfNarrowphase::GetBoundarySamplesCached(
 }
 
 double SdfNarrowphase::GetModelBoundRadiusCached(chrono::ChCollisionModel* model) const {
+    if (!cache_enabled_) {
+        return ComputeModelBoundRadius(model);
+    }
+
     auto it = model_bound_radius_cache_.find(model);
     if (it != model_bound_radius_cache_.end()) {
         return it->second;
     }
 
+    const double radius = ComputeModelBoundRadius(model);
+    model_bound_radius_cache_[model] = radius;
+    return radius;
+}
+
+double SdfNarrowphase::ComputeModelBoundRadius(chrono::ChCollisionModel* model) const {
     double radius = 0.0;
     if (model) {
         const auto& shape_instances = model->GetShapeInstances();
@@ -431,8 +458,6 @@ double SdfNarrowphase::GetModelBoundRadiusCached(chrono::ChCollisionModel* model
             }
         }
     }
-
-    model_bound_radius_cache_[model] = radius;
     return radius;
 }
 
@@ -443,13 +468,28 @@ const SdfNarrowphase::OtherModelSupportCache& SdfNarrowphase::GetOtherModelSuppo
         return kEmptyCache;
     }
 
+    if (!cache_enabled_) {
+        other_support_scratch_ = BuildOtherModelSupport(model);
+        return other_support_scratch_;
+    }
+
     const auto& shape_instances = model->GetShapeInstances();
     auto it = other_support_cache_.find(model);
     if (it != other_support_cache_.end() && it->second.shape_count == shape_instances.size()) {
         return it->second;
     }
 
+    auto inserted = other_support_cache_.insert_or_assign(model, BuildOtherModelSupport(model));
+    return inserted.first->second;
+}
+
+SdfNarrowphase::OtherModelSupportCache SdfNarrowphase::BuildOtherModelSupport(chrono::ChCollisionModel* model) const {
     OtherModelSupportCache cache;
+    if (!model) {
+        return cache;
+    }
+
+    const auto& shape_instances = model->GetShapeInstances();
     cache.shape_count = shape_instances.size();
     cache.queries.reserve(std::min<std::size_t>(kMaxQueriesPerModel, shape_instances.size() * 8));
 
@@ -523,6 +563,9 @@ const SdfNarrowphase::OtherModelSupportCache& SdfNarrowphase::GetOtherModelSuppo
         chrono::ChVector3d(-1.0, 1.0, -1.0),  chrono::ChVector3d(1.0, 1.0, -1.0),
         chrono::ChVector3d(-1.0, -1.0, 1.0),  chrono::ChVector3d(1.0, -1.0, 1.0),
         chrono::ChVector3d(-1.0, 1.0, 1.0),   chrono::ChVector3d(1.0, 1.0, 1.0)};
+    static const std::array<chrono::ChVector3d, kBoxFaceSamples> kBoxFaceDirs = {
+        chrono::ChVector3d(1.0, 0.0, 0.0),  chrono::ChVector3d(-1.0, 0.0, 0.0), chrono::ChVector3d(0.0, 1.0, 0.0),
+        chrono::ChVector3d(0.0, -1.0, 0.0), chrono::ChVector3d(0.0, 0.0, 1.0),  chrono::ChVector3d(0.0, 0.0, -1.0)};
 
     for (const auto& instance : shape_instances) {
         if (!instance.shape || cache.queries.size() >= kMaxQueriesPerModel) {
@@ -548,6 +591,10 @@ const SdfNarrowphase::OtherModelSupportCache& SdfNarrowphase::GetOtherModelSuppo
                 const chrono::ChVector3d p_shape_local(d.x() * h.x(), d.y() * h.y(), d.z() * h.z());
                 append_point_query(ToModelPoint(instance, p_shape_local), material);
             }
+            for (const auto& d : kBoxFaceDirs) {
+                const chrono::ChVector3d p_shape_local(d.x() * h.x(), d.y() * h.y(), d.z() * h.z());
+                append_point_query(ToModelPoint(instance, p_shape_local), material);
+            }
             continue;
         }
 
@@ -559,9 +606,7 @@ const SdfNarrowphase::OtherModelSupportCache& SdfNarrowphase::GetOtherModelSuppo
     }
 
     cache.bound_radius = GetModelBoundRadiusCached(model);
-
-    auto inserted = other_support_cache_.insert_or_assign(model, std::move(cache));
-    return inserted.first->second;
+    return cache;
 }
 
 void SdfNarrowphase::SetSdfSdfSamplingMode(SdfSdfSamplingMode mode) {
@@ -570,6 +615,28 @@ void SdfNarrowphase::SetSdfSdfSamplingMode(SdfSdfSamplingMode mode) {
 
 SdfSdfSamplingMode SdfNarrowphase::GetSdfSdfSamplingMode() const {
     return sdf_sdf_sampling_mode_;
+}
+
+void SdfNarrowphase::SetCacheEnabled(bool enabled) {
+    if (cache_enabled_ == enabled) {
+        return;
+    }
+    cache_enabled_ = enabled;
+    boundary_samples_cache_.clear();
+    model_bound_radius_cache_.clear();
+    other_support_cache_.clear();
+}
+
+bool SdfNarrowphase::IsCacheEnabled() const {
+    return cache_enabled_;
+}
+
+void SdfNarrowphase::SetBoundCullEnabled(bool enabled) {
+    bound_cull_enabled_ = enabled;
+}
+
+bool SdfNarrowphase::IsBoundCullEnabled() const {
+    return bound_cull_enabled_;
 }
 
 void SdfNarrowphase::BuildContactsForPair(const SdfRegistry& registry,
@@ -622,7 +689,7 @@ void SdfNarrowphase::BuildContactsForPair(const SdfRegistry& registry,
         return;
     }
 
-    if (support.bound_radius > 0.0) {
+    if (bound_cull_enabled_ && support.bound_radius > 0.0) {
         const auto center_sample = proxy_sdf.sdf->SampleBodyPose(sdf_pose.pos, sdf_pose.rot, other_pose.pos);
         if (center_sample.phi > support.bound_radius) {
             return;

@@ -225,6 +225,9 @@ struct RunResult {
     double step_size = 0.0;
     int steps = 0;
     int dynamic_body_count = 0;
+    int clustering_enabled = 1;
+    int cache_enabled = 1;
+    int bound_cull_enabled = 1;
     double wall_time_s = 0.0;
     double avg_contacts = 0.0;
     unsigned int max_contacts = 0;
@@ -235,12 +238,28 @@ struct RunResult {
     bool exploded = false;
 };
 
+struct TrajectoryRow {
+    std::string scene;
+    std::string mode;
+    double step_size = 0.0;
+    int step = 0;
+    double time = 0.0;
+    int body_id = 0;
+    double com_x = 0.0;
+    double com_y = 0.0;
+    double com_z = 0.0;
+};
+
 struct SceneMatrixConfig {
     std::string csv_path = "sdf_p2_scene_matrix.csv";
+    std::string trajectory_csv_path;
     double duration = 1.2;
     std::vector<double> step_sizes = {1e-3, 2e-3, 3e-3};
     std::size_t kmax = 64;
     double cell_size = 0.05;
+    bool clustering_enabled = true;
+    bool cache_enabled = true;
+    bool bound_cull_enabled = true;
     std::uint64_t seed = 42;
 };
 
@@ -315,8 +334,9 @@ bool ParseStepSizes(const std::string& text, std::vector<double>& out_steps) {
 
 void PrintUsage(const char* exe_name) {
     std::cout << "Usage: " << exe_name
-              << " [--csv <path>] [--duration <seconds>] [--dts <h1,h2,...>] [--kmax <int>] [--cell-size <meters>]"
-                 " [--seed <u64>]\n";
+              << " [--csv <path>] [--trajectory-csv <path>] [--duration <seconds>] [--dts <h1,h2,...>]"
+                 " [--kmax <int>] [--cell-size <meters>]"
+                 " [--seed <u64>] [--no-cluster] [--no-cache] [--no-bound-cull]\n";
 }
 
 bool ParseArgs(int argc, char* argv[], SceneMatrixConfig& cfg) {
@@ -352,6 +372,15 @@ bool ParseArgs(int argc, char* argv[], SceneMatrixConfig& cfg) {
                 return false;
             }
             cfg.csv_path = val;
+            continue;
+        }
+
+        if (arg == "--trajectory-csv") {
+            const auto* val = need_value("--trajectory-csv");
+            if (!val) {
+                return false;
+            }
+            cfg.trajectory_csv_path = val;
             continue;
         }
 
@@ -397,6 +426,21 @@ bool ParseArgs(int argc, char* argv[], SceneMatrixConfig& cfg) {
                 std::cerr << "Invalid --seed value" << std::endl;
                 return false;
             }
+            continue;
+        }
+
+        if (arg == "--no-cluster") {
+            cfg.clustering_enabled = false;
+            continue;
+        }
+
+        if (arg == "--no-cache") {
+            cfg.cache_enabled = false;
+            continue;
+        }
+
+        if (arg == "--no-bound-cull") {
+            cfg.bound_cull_enabled = false;
             continue;
         }
 
@@ -494,7 +538,11 @@ void BuildSceneBodies(P2SceneId scene,
     }
 }
 
-RunResult RunCase(P2SceneId scene, bool use_sdf_contact, double step_size, const SceneMatrixConfig& cfg) {
+RunResult RunCase(P2SceneId scene,
+                  bool use_sdf_contact,
+                  double step_size,
+                  const SceneMatrixConfig& cfg,
+                  std::vector<TrajectoryRow>* trajectory_rows) {
     using namespace chrono;
     using namespace chrono_sdf_contact;
 
@@ -522,9 +570,12 @@ RunResult RunCase(P2SceneId scene, bool use_sdf_contact, double step_size, const
         auto registry = std::make_shared<SdfRegistry>();
         pair_cache = std::make_shared<SdfPairCache>();
         auto narrowphase = std::make_shared<SdfNarrowphase>();
+        narrowphase->SetCacheEnabled(cfg.cache_enabled);
+        narrowphase->SetBoundCullEnabled(cfg.bound_cull_enabled);
         auto clustering = std::make_shared<SdfClustering>(cfg.kmax, cfg.cell_size);
         auto narrow_cb = std::make_shared<SdfNarrowphaseCallback>(registry, pair_cache);
         auto custom_cb = std::make_shared<SdfCustomCollisionCallback>(registry, pair_cache, narrowphase, clustering);
+        custom_cb->SetClusteringEnabled(cfg.clustering_enabled);
 
         SdfProxy ground_proxy;
         ground_proxy.sdf = std::make_shared<PlaneSdfVolume>(0.1);
@@ -551,6 +602,8 @@ RunResult RunCase(P2SceneId scene, bool use_sdf_contact, double step_size, const
         dynamic_bodies.push_back(spec.body);
     }
 
+    const std::string scene_name = SceneName(scene);
+    const std::string mode_name = use_sdf_contact ? "sdf_contact" : "chrono_baseline";
     auto reporter = std::make_shared<MinDistanceReporter>();
     double min_dist = std::numeric_limits<double>::infinity();
     double min_height = std::numeric_limits<double>::infinity();
@@ -561,6 +614,12 @@ RunResult RunCase(P2SceneId scene, bool use_sdf_contact, double step_size, const
     const auto gravity = sys.GetGravitationalAcceleration();
     const double energy0 = ComputeBodiesMechanicalEnergy(dynamic_bodies, gravity);
     double max_relative_energy_drift = 0.0;
+    if (trajectory_rows) {
+        for (std::size_t i = 0; i < dynamic_bodies.size(); ++i) {
+            const auto p = dynamic_bodies[i]->GetPos();
+            trajectory_rows->push_back({scene_name, mode_name, step_size, 0, 0.0, static_cast<int>(i), p.x(), p.y(), p.z()});
+        }
+    }
 
     const int num_steps = std::max(1, static_cast<int>(cfg.duration / step_size));
     const auto t0 = std::chrono::high_resolution_clock::now();
@@ -580,6 +639,15 @@ RunResult RunCase(P2SceneId scene, bool use_sdf_contact, double step_size, const
         }
         if (exploded) {
             break;
+        }
+
+        if (trajectory_rows) {
+            for (std::size_t i = 0; i < dynamic_bodies.size(); ++i) {
+                const auto p = dynamic_bodies[i]->GetPos();
+                trajectory_rows->push_back(
+                    {scene_name, mode_name, step_size, step + 1, (step + 1) * step_size, static_cast<int>(i), p.x(),
+                     p.y(), p.z()});
+            }
         }
 
         const auto ncontacts = sys.GetNumContacts();
@@ -609,11 +677,14 @@ RunResult RunCase(P2SceneId scene, bool use_sdf_contact, double step_size, const
     }
 
     RunResult out;
-    out.scene = SceneName(scene);
-    out.mode = use_sdf_contact ? "sdf_contact" : "chrono_baseline";
+    out.scene = scene_name;
+    out.mode = mode_name;
     out.step_size = step_size;
     out.steps = num_steps;
     out.dynamic_body_count = static_cast<int>(dynamic_bodies.size());
+    out.clustering_enabled = cfg.clustering_enabled ? 1 : 0;
+    out.cache_enabled = cfg.cache_enabled ? 1 : 0;
+    out.bound_cull_enabled = cfg.bound_cull_enabled ? 1 : 0;
     out.wall_time_s = std::chrono::duration<double>(t1 - t0).count();
     out.avg_contacts = (num_steps > 0) ? static_cast<double>(total_contacts) / static_cast<double>(num_steps) : 0.0;
     out.max_contacts = max_contacts;
@@ -625,6 +696,18 @@ RunResult RunCase(P2SceneId scene, bool use_sdf_contact, double step_size, const
     return out;
 }
 
+void WriteTrajectoryCsv(const std::string& path, const std::vector<TrajectoryRow>& rows) {
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        throw std::runtime_error("Failed to open trajectory CSV file: " + path);
+    }
+    out << "scene,mode,step_size,step,time,body_id,com_x,com_y,com_z\n";
+    for (const auto& r : rows) {
+        out << r.scene << "," << r.mode << "," << r.step_size << "," << r.step << "," << r.time << "," << r.body_id
+            << "," << r.com_x << "," << r.com_y << "," << r.com_z << "\n";
+    }
+}
+
 void PrintResult(const RunResult& r) {
     std::cout << "[" << r.scene << ", " << r.mode << ", dt=" << r.step_size << "] "
               << "wall_time_s=" << std::fixed << std::setprecision(6) << r.wall_time_s
@@ -632,7 +715,10 @@ void PrintResult(const RunResult& r) {
               << ", max_penetration=" << r.max_penetration << ", min_height=" << r.min_height
               << ", final_height=" << r.final_height
               << ", max_relative_energy_drift=" << r.max_relative_energy_drift
-              << ", exploded=" << (r.exploded ? 1 : 0) << std::endl;
+              << ", exploded=" << (r.exploded ? 1 : 0)
+              << ", clustering=" << r.clustering_enabled
+              << ", cache=" << r.cache_enabled
+              << ", bound_cull=" << r.bound_cull_enabled << std::endl;
 }
 
 void WriteCsv(const std::string& path, const std::vector<RunResult>& rows) {
@@ -640,11 +726,13 @@ void WriteCsv(const std::string& path, const std::vector<RunResult>& rows) {
     if (!out.is_open()) {
         throw std::runtime_error("Failed to open CSV file: " + path);
     }
-    out << "scene,mode,step_size,steps,dynamic_body_count,wall_time_s,avg_contacts,max_contacts,max_penetration,min_height,final_height,max_relative_energy_drift,exploded\n";
+    out << "scene,mode,step_size,steps,dynamic_body_count,clustering_enabled,cache_enabled,bound_cull_enabled,wall_time_s,avg_contacts,max_contacts,max_penetration,min_height,final_height,max_relative_energy_drift,exploded\n";
     for (const auto& r : rows) {
-        out << r.scene << "," << r.mode << "," << r.step_size << "," << r.steps << "," << r.dynamic_body_count << ","
+        out << r.scene << "," << r.mode << "," << r.step_size << "," << r.steps << "," << r.dynamic_body_count
+            << "," << r.clustering_enabled << "," << r.cache_enabled << "," << r.bound_cull_enabled << ","
             << r.wall_time_s << "," << r.avg_contacts << "," << r.max_contacts << "," << r.max_penetration << ","
-            << r.min_height << "," << r.final_height << "," << r.max_relative_energy_drift << ","
+            << r.min_height << "," << r.final_height << ","
+            << r.max_relative_energy_drift << ","
             << (r.exploded ? 1 : 0) << "\n";
     }
 }
@@ -661,11 +749,14 @@ int main(int argc, char* argv[]) {
         std::vector<RunResult> results;
         const auto scenes = AllScenes();
         results.reserve(cfg.step_sizes.size() * scenes.size() * 2);
+        std::vector<TrajectoryRow> trajectories;
 
         for (double dt : cfg.step_sizes) {
             for (auto scene : scenes) {
-                results.push_back(RunCase(scene, false, dt, cfg));
-                results.push_back(RunCase(scene, true, dt, cfg));
+                results.push_back(
+                    RunCase(scene, false, dt, cfg, cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
+                results.push_back(
+                    RunCase(scene, true, dt, cfg, cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
             }
         }
 
@@ -674,6 +765,10 @@ int main(int argc, char* argv[]) {
         }
         WriteCsv(cfg.csv_path, results);
         std::cout << "CSV written to: " << cfg.csv_path << std::endl;
+        if (!cfg.trajectory_csv_path.empty()) {
+            WriteTrajectoryCsv(cfg.trajectory_csv_path, trajectories);
+            std::cout << "Trajectory CSV written to: " << cfg.trajectory_csv_path << std::endl;
+        }
 
         for (double dt : cfg.step_sizes) {
             for (auto scene : scenes) {

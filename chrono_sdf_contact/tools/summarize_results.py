@@ -541,6 +541,53 @@ def p2_scene_section(scene_rows, sig_samples=2000, sig_seed=12345):
                 p=fmt(p),
             )
         )
+
+    lines.append("")
+    lines.append(f"Exploded significance by scene-step (permutation test, two-sided, samples={sig_samples}):")
+    lines.append("")
+    lines.append(
+        "| scene | step_size | n_baseline | n_sdf | chrono_baseline_exploded_rate | "
+        "sdf_contact_exploded_rate | delta(sdf-baseline) | p_value |"
+    )
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+
+    scene_dt_pairs = sorted(
+        {(r.get("scene", ""), to_float(r, "step_size")) for r in scene_rows},
+        key=lambda x: (x[0], x[1]),
+    )
+    for scene, dt in scene_dt_pairs:
+        subset = [
+            r
+            for r in scene_rows
+            if r.get("scene", "") == scene and abs(to_float(r, "step_size") - dt) < 1e-12
+        ]
+        b_vals = metric_vals(subset, "chrono_baseline", "exploded")
+        s_vals = metric_vals(subset, "sdf_contact", "exploded")
+        b_mean = mean(b_vals)
+        s_mean = mean(s_vals)
+        scene_code = sum(ord(ch) for ch in scene)
+        dt_code = int(round(dt * 1e6))
+        p = permutation_pvalue(
+            b_vals,
+            s_vals,
+            samples=sig_samples,
+            seed=sig_seed + 503 + scene_code * 17 + dt_code,
+        )
+        b_rate = (f"{fmt(100.0 * b_mean, 4)}%" if b_mean is not None else "-")
+        s_rate = (f"{fmt(100.0 * s_mean, 4)}%" if s_mean is not None else "-")
+        delta = (f"{fmt(100.0 * (s_mean - b_mean), 4)}%" if (s_mean is not None and b_mean is not None) else "-")
+        lines.append(
+            "| {scene} | {dt} | {nb} | {ns} | {br} | {sr} | {delta} | {p} |".format(
+                scene=scene,
+                dt=fmt(dt),
+                nb=len(b_vals),
+                ns=len(s_vals),
+                br=b_rate,
+                sr=s_rate,
+                delta=delta,
+                p=fmt(p),
+            )
+        )
     lines.append("")
     return lines
 

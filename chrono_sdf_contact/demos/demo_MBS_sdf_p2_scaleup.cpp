@@ -137,8 +137,21 @@ struct ScaleupResult {
     bool exploded = false;
 };
 
+struct TrajectoryRow {
+    std::string mode;
+    int body_count = 0;
+    double step_size = 0.0;
+    int step = 0;
+    double time = 0.0;
+    int body_id = 0;
+    double com_x = 0.0;
+    double com_y = 0.0;
+    double com_z = 0.0;
+};
+
 struct ScaleupConfig {
     std::string csv_path = "sdf_p2_scaleup.csv";
+    std::string trajectory_csv_path;
     double duration = 0.8;
     double step_size = 1.5e-3;
     std::vector<int> body_counts = {8, 16, 32, 64};
@@ -222,7 +235,8 @@ bool ParseIntList(const std::string& text, std::vector<int>& out_counts) {
 
 void PrintUsage(const char* exe_name) {
     std::cout << "Usage: " << exe_name
-              << " [--csv <path>] [--duration <seconds>] [--dt <seconds>] [--counts <c1,c2,...>] [--kmax <int>]"
+              << " [--csv <path>] [--trajectory-csv <path>] [--duration <seconds>] [--dt <seconds>]"
+                 " [--counts <c1,c2,...>] [--kmax <int>]"
                  " [--cell-size <meters>] [--seed <u64>]\n";
 }
 
@@ -259,6 +273,14 @@ bool ParseArgs(int argc, char* argv[], ScaleupConfig& cfg) {
                 return false;
             }
             cfg.csv_path = val;
+            continue;
+        }
+        if (arg == "--trajectory-csv") {
+            const auto* val = need_value("--trajectory-csv");
+            if (!val) {
+                return false;
+            }
+            cfg.trajectory_csv_path = val;
             continue;
         }
         if (arg == "--duration") {
@@ -321,7 +343,10 @@ bool ParseArgs(int argc, char* argv[], ScaleupConfig& cfg) {
     return true;
 }
 
-ScaleupResult RunCase(int body_count, bool use_sdf_contact, const ScaleupConfig& cfg) {
+ScaleupResult RunCase(int body_count,
+                      bool use_sdf_contact,
+                      const ScaleupConfig& cfg,
+                      std::vector<TrajectoryRow>* trajectory_rows) {
     using namespace chrono;
     using namespace chrono_sdf_contact;
 
@@ -400,11 +425,19 @@ ScaleupResult RunCase(int body_count, bool use_sdf_contact, const ScaleupConfig&
         }
     }
 
+    const std::string mode_name = use_sdf_contact ? "sdf_contact" : "chrono_baseline";
     const int num_steps = std::max(1, static_cast<int>(cfg.duration / cfg.step_size));
     const auto gravity = sys.GetGravitationalAcceleration();
     const double energy0 = ComputeBodiesMechanicalEnergy(bodies, gravity);
     double max_relative_energy_drift = 0.0;
     bool exploded = false;
+    if (trajectory_rows) {
+        for (std::size_t i = 0; i < bodies.size(); ++i) {
+            const auto p = bodies[i]->GetPos();
+            trajectory_rows->push_back(
+                {mode_name, body_count, cfg.step_size, 0, 0.0, static_cast<int>(i), p.x(), p.y(), p.z()});
+        }
+    }
 
     auto reporter = std::make_shared<MinDistanceReporter>();
     double min_dist = std::numeric_limits<double>::infinity();
@@ -429,6 +462,14 @@ ScaleupResult RunCase(int body_count, bool use_sdf_contact, const ScaleupConfig&
             break;
         }
 
+        if (trajectory_rows) {
+            for (std::size_t i = 0; i < bodies.size(); ++i) {
+                const auto p = bodies[i]->GetPos();
+                trajectory_rows->push_back({mode_name, body_count, cfg.step_size, step + 1, (step + 1) * cfg.step_size,
+                                            static_cast<int>(i), p.x(), p.y(), p.z()});
+            }
+        }
+
         const auto ncontacts = sys.GetNumContacts();
         total_contacts += ncontacts;
         max_contacts = std::max(max_contacts, ncontacts);
@@ -448,7 +489,7 @@ ScaleupResult RunCase(int body_count, bool use_sdf_contact, const ScaleupConfig&
     const auto t1 = std::chrono::high_resolution_clock::now();
 
     ScaleupResult out;
-    out.mode = use_sdf_contact ? "sdf_contact" : "chrono_baseline";
+    out.mode = mode_name;
     out.body_count = body_count;
     out.steps = num_steps;
     out.step_size = cfg.step_size;
@@ -459,6 +500,18 @@ ScaleupResult RunCase(int body_count, bool use_sdf_contact, const ScaleupConfig&
     out.max_relative_energy_drift = max_relative_energy_drift;
     out.exploded = exploded;
     return out;
+}
+
+void WriteTrajectoryCsv(const std::string& path, const std::vector<TrajectoryRow>& rows) {
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        throw std::runtime_error("Failed to open trajectory CSV file: " + path);
+    }
+    out << "mode,body_count,step_size,step,time,body_id,com_x,com_y,com_z\n";
+    for (const auto& r : rows) {
+        out << r.mode << "," << r.body_count << "," << r.step_size << "," << r.step << "," << r.time << "," << r.body_id
+            << "," << r.com_x << "," << r.com_y << "," << r.com_z << "\n";
+    }
 }
 
 void PrintResult(const ScaleupResult& r) {
@@ -494,9 +547,12 @@ int main(int argc, char* argv[]) {
     try {
         std::vector<ScaleupResult> results;
         results.reserve(cfg.body_counts.size() * 2);
+        std::vector<TrajectoryRow> trajectories;
         for (int body_count : cfg.body_counts) {
-            results.push_back(RunCase(body_count, false, cfg));
-            results.push_back(RunCase(body_count, true, cfg));
+            results.push_back(
+                RunCase(body_count, false, cfg, cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
+            results.push_back(
+                RunCase(body_count, true, cfg, cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
         }
 
         for (const auto& r : results) {
@@ -504,6 +560,10 @@ int main(int argc, char* argv[]) {
         }
         WriteCsv(cfg.csv_path, results);
         std::cout << "CSV written to: " << cfg.csv_path << std::endl;
+        if (!cfg.trajectory_csv_path.empty()) {
+            WriteTrajectoryCsv(cfg.trajectory_csv_path, trajectories);
+            std::cout << "Trajectory CSV written to: " << cfg.trajectory_csv_path << std::endl;
+        }
 
         for (int count : cfg.body_counts) {
             bool ok = false;

@@ -95,6 +95,16 @@ struct RunResult {
     double max_relative_energy_drift = 0.0;
 };
 
+struct TrajectoryRow {
+    std::string mode;
+    int step = 0;
+    double time = 0.0;
+    int body_id = 0;
+    double com_x = 0.0;
+    double com_y = 0.0;
+    double com_z = 0.0;
+};
+
 double ComputeBodyMechanicalEnergy(chrono::ChBody* body, const chrono::ChVector3d& gravity_acc) {
     if (!body) {
         return 0.0;
@@ -113,6 +123,7 @@ double ComputeBodyMechanicalEnergy(chrono::ChBody* body, const chrono::ChVector3
 
 struct MeshCompareConfig {
     std::string csv_path = "sdf_mesh_baseline_compare.csv";
+    std::string trajectory_csv_path;
     int num_steps = 1200;
     double step_size = 1e-3;
     std::size_t kmax = 64;
@@ -173,7 +184,8 @@ void BuildMeshInitialPose(std::uint64_t seed, chrono::ChVector3d& pos, chrono::C
 
 void PrintUsage(const char* exe_name) {
     std::cout << "Usage: " << exe_name
-              << " [--csv <path>] [--steps <int>] [--dt <seconds>] [--kmax <int>] [--cell-size <meters>] [--seed <u64>]\n";
+              << " [--csv <path>] [--trajectory-csv <path>] [--steps <int>] [--dt <seconds>] [--kmax <int>]"
+                 " [--cell-size <meters>] [--seed <u64>]\n";
 }
 
 bool ParseArgs(int argc, char* argv[], MeshCompareConfig& cfg) {
@@ -210,6 +222,15 @@ bool ParseArgs(int argc, char* argv[], MeshCompareConfig& cfg) {
                 return false;
             }
             cfg.csv_path = val;
+            continue;
+        }
+
+        if (arg == "--trajectory-csv") {
+            const auto* val = need_value("--trajectory-csv");
+            if (!val) {
+                return false;
+            }
+            cfg.trajectory_csv_path = val;
             continue;
         }
 
@@ -269,7 +290,7 @@ bool ParseArgs(int argc, char* argv[], MeshCompareConfig& cfg) {
     return true;
 }
 
-RunResult RunScenario(bool use_sdf_contact, const MeshCompareConfig& cfg) {
+RunResult RunScenario(bool use_sdf_contact, const MeshCompareConfig& cfg, std::vector<TrajectoryRow>* trajectory_rows) {
     using namespace chrono;
     using namespace chrono_sdf_contact;
 
@@ -336,6 +357,7 @@ RunResult RunScenario(bool use_sdf_contact, const MeshCompareConfig& cfg) {
         sys.RegisterCustomCollisionCallback(custom_cb);
     }
 
+    const std::string mode_name = use_sdf_contact ? "sdf_contact" : "chrono_baseline";
     auto reporter = std::make_shared<MinDistanceReporter>();
     double min_distance = std::numeric_limits<double>::infinity();
     double min_mesh_height = mesh_body->GetPos().y();
@@ -344,6 +366,10 @@ RunResult RunScenario(bool use_sdf_contact, const MeshCompareConfig& cfg) {
     const auto gravity = sys.GetGravitationalAcceleration();
     const double energy0 = ComputeBodyMechanicalEnergy(mesh_body.get(), gravity);
     double max_relative_energy_drift = 0.0;
+    if (trajectory_rows) {
+        const auto p = mesh_body->GetPos();
+        trajectory_rows->push_back({mode_name, 0, 0.0, 0, p.x(), p.y(), p.z()});
+    }
 
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int step = 0; step < cfg.num_steps; ++step) {
@@ -368,11 +394,16 @@ RunResult RunScenario(bool use_sdf_contact, const MeshCompareConfig& cfg) {
                 min_distance = std::min(min_distance, reporter->GetMinDistance());
             }
         }
+
+        if (trajectory_rows) {
+            const auto p = mesh_body->GetPos();
+            trajectory_rows->push_back({mode_name, step + 1, (step + 1) * cfg.step_size, 0, p.x(), p.y(), p.z()});
+        }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
 
     RunResult result;
-    result.mode = use_sdf_contact ? "sdf_contact" : "chrono_baseline";
+    result.mode = mode_name;
     result.wall_time_s = std::chrono::duration<double>(t1 - t0).count();
     result.avg_contacts = static_cast<double>(total_contacts) / static_cast<double>(cfg.num_steps);
     result.max_contacts = max_contacts;
@@ -381,6 +412,18 @@ RunResult RunScenario(bool use_sdf_contact, const MeshCompareConfig& cfg) {
     result.final_mesh_height = mesh_body->GetPos().y();
     result.max_relative_energy_drift = max_relative_energy_drift;
     return result;
+}
+
+void WriteTrajectoryCsv(const std::string& path, const std::vector<TrajectoryRow>& rows) {
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        throw std::runtime_error("Failed to open trajectory CSV file: " + path);
+    }
+    out << "mode,step,time,body_id,com_x,com_y,com_z\n";
+    for (const auto& r : rows) {
+        out << r.mode << "," << r.step << "," << r.time << "," << r.body_id << "," << r.com_x << "," << r.com_y << ","
+            << r.com_z << "\n";
+    }
 }
 
 void PrintResult(const RunResult& result) {
@@ -421,12 +464,21 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        auto baseline = RunScenario(false, cfg);
-        auto sdf = RunScenario(true, cfg);
+        std::vector<TrajectoryRow> trajectories;
+        if (!cfg.trajectory_csv_path.empty()) {
+            trajectories.reserve(static_cast<std::size_t>(2 * (cfg.num_steps + 1)));
+        }
+
+        auto baseline = RunScenario(false, cfg, cfg.trajectory_csv_path.empty() ? nullptr : &trajectories);
+        auto sdf = RunScenario(true, cfg, cfg.trajectory_csv_path.empty() ? nullptr : &trajectories);
 
         PrintResult(baseline);
         PrintResult(sdf);
         WriteCsv(cfg.csv_path, cfg.num_steps, cfg.step_size, baseline, sdf);
+        if (!cfg.trajectory_csv_path.empty()) {
+            WriteTrajectoryCsv(cfg.trajectory_csv_path, trajectories);
+            std::cout << "Trajectory CSV written to: " << cfg.trajectory_csv_path << std::endl;
+        }
 
         std::cout << "CSV written to: " << cfg.csv_path << std::endl;
 
