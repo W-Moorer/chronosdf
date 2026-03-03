@@ -10,6 +10,11 @@ param(
     [bool]$RunP2 = $true,
     [double]$P2SceneDuration = 1.2,
     [string]$P2SceneDts = "0.001,0.002,0.003",
+    [bool]$P2NoCluster = $false,
+    [bool]$P2AdaptiveStack3Fast = $false,
+    [bool]$P2IncludeNscLcp = $false,
+    [bool]$P2ScaleSdfA2bOnly = $false,
+    [bool]$P2ScaleSdfBoxSamplesLite = $false,
     [double]$P2ScaleDuration = 0.8,
     [double]$P2ScaleDt = 0.0015,
     [string]$P2ScaleCounts = "8,16,32,64",
@@ -236,14 +241,33 @@ for ($i = 0; $i -lt $NumSeeds; $i++) {
         $p2AllowedCodes = if ($AllowP2ValidationFailure) { @(0, 3) } else { @(0) }
 
         Write-Host "Running P2 scene matrix benchmark (seed=$seed)..."
-        Invoke-DemoChecked -ExePath $p2SceneExe -Name "demo_MBS_sdf_p2_scene_matrix" -CommandArgs @(
-            "--csv", $p2SceneSeedCsv, "--duration", "$P2SceneDuration", "--dts", "$P2SceneDts", "--seed", "$seed"
-        ) -AllowedExitCodes $p2AllowedCodes -RequiredOutputs @($p2SceneSeedCsv)
+        $p2SceneArgs = @("--csv", $p2SceneSeedCsv, "--duration", "$P2SceneDuration", "--dts", "$P2SceneDts", "--seed", "$seed")
+        if ($P2NoCluster) {
+            $p2SceneArgs += "--no-cluster"
+        }
+        if ($P2AdaptiveStack3Fast) {
+            $p2SceneArgs += "--adaptive-stack3-fast"
+        }
+        if ($P2IncludeNscLcp) {
+            $p2SceneArgs += "--include-nsc-lcp"
+        }
+        Invoke-DemoChecked -ExePath $p2SceneExe -Name "demo_MBS_sdf_p2_scene_matrix" -CommandArgs $p2SceneArgs -AllowedExitCodes $p2AllowedCodes -RequiredOutputs @($p2SceneSeedCsv)
 
         Write-Host "Running P2 scale-up benchmark (seed=$seed)..."
-        Invoke-DemoChecked -ExePath $p2ScaleExe -Name "demo_MBS_sdf_p2_scaleup" -CommandArgs @(
-            "--csv", $p2ScaleSeedCsv, "--duration", "$P2ScaleDuration", "--dt", "$P2ScaleDt", "--counts", "$P2ScaleCounts", "--seed", "$seed"
-        ) -AllowedExitCodes $p2AllowedCodes -RequiredOutputs @($p2ScaleSeedCsv)
+        $p2ScaleArgs = @("--csv", $p2ScaleSeedCsv, "--duration", "$P2ScaleDuration", "--dt", "$P2ScaleDt", "--counts", "$P2ScaleCounts", "--seed", "$seed")
+        if ($P2NoCluster) {
+            $p2ScaleArgs += "--no-cluster"
+        }
+        if ($P2IncludeNscLcp) {
+            $p2ScaleArgs += "--include-nsc-lcp"
+        }
+        if ($P2ScaleSdfA2bOnly) {
+            $p2ScaleArgs += "--sdf-sdf-a2b-only"
+        }
+        if ($P2ScaleSdfBoxSamplesLite) {
+            $p2ScaleArgs += "--sdf-box-samples-lite"
+        }
+        Invoke-DemoChecked -ExePath $p2ScaleExe -Name "demo_MBS_sdf_p2_scaleup" -CommandArgs $p2ScaleArgs -AllowedExitCodes $p2AllowedCodes -RequiredOutputs @($p2ScaleSeedCsv)
     }
 
     if ($RunM3) {
@@ -442,6 +466,11 @@ if ($WriteMetadata) {
             RunP2 = $RunP2
             P2SceneDuration = $P2SceneDuration
             P2SceneDts = $P2SceneDts
+            P2NoCluster = $P2NoCluster
+            P2AdaptiveStack3Fast = $P2AdaptiveStack3Fast
+            P2IncludeNscLcp = $P2IncludeNscLcp
+            P2ScaleSdfA2bOnly = $P2ScaleSdfA2bOnly
+            P2ScaleSdfBoxSamplesLite = $P2ScaleSdfBoxSamplesLite
             P2ScaleDuration = $P2ScaleDuration
             P2ScaleDt = $P2ScaleDt
             P2ScaleCounts = $P2ScaleCounts

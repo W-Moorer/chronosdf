@@ -32,6 +32,11 @@ Write-Host "AllowP2ValidationFailure=$AllowP2ValidationFailure"
     -BaseSeed $BaseSeed `
     -RunP2 $true `
     -P2SceneDts "0.001,0.002,0.003" `
+    -P2NoCluster $true `
+    -P2AdaptiveStack3Fast $true `
+    -P2IncludeNscLcp $true `
+    -P2ScaleSdfA2bOnly $false `
+    -P2ScaleSdfBoxSamplesLite $true `
     -P2ScaleCounts "8,16,32,64" `
     -RunM3 $RunM3 `
     -ValidateP1 $true `

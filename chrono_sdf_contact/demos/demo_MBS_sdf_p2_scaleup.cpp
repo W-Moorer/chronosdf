@@ -16,8 +16,11 @@
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChBodyEasy.h"
 #include "chrono/physics/ChContactContainer.h"
+#include "chrono/physics/ChContactMaterialNSC.h"
 #include "chrono/physics/ChContactMaterialSMC.h"
+#include "chrono/physics/ChSystemNSC.h"
 #include "chrono/physics/ChSystemSMC.h"
+#include "chrono/solver/ChSolver.h"
 
 #include "SdfClustering.h"
 #include "SdfCustomCollisionCallback.h"
@@ -129,6 +132,7 @@ struct ScaleupResult {
     int body_count = 0;
     int steps = 0;
     double step_size = 0.0;
+    int clustering_enabled = 1;
     double wall_time_s = 0.0;
     double avg_contacts = 0.0;
     unsigned int max_contacts = 0;
@@ -157,6 +161,10 @@ struct ScaleupConfig {
     std::vector<int> body_counts = {8, 16, 32, 64};
     std::size_t kmax = 64;
     double cell_size = 0.05;
+    bool clustering_enabled = true;
+    bool sdf_sdf_a2b_only = false;
+    bool sdf_box_samples_lite = false;
+    bool include_nsc_lcp = false;
     std::uint64_t seed = 42;
 };
 
@@ -237,7 +245,8 @@ void PrintUsage(const char* exe_name) {
     std::cout << "Usage: " << exe_name
               << " [--csv <path>] [--trajectory-csv <path>] [--duration <seconds>] [--dt <seconds>]"
                  " [--counts <c1,c2,...>] [--kmax <int>]"
-                 " [--cell-size <meters>] [--seed <u64>]\n";
+                 " [--cell-size <meters>] [--seed <u64>] [--no-cluster] [--sdf-sdf-a2b-only]"
+                 " [--sdf-box-samples-lite] [--include-nsc-lcp]\n";
 }
 
 bool ParseArgs(int argc, char* argv[], ScaleupConfig& cfg) {
@@ -331,6 +340,22 @@ bool ParseArgs(int argc, char* argv[], ScaleupConfig& cfg) {
             }
             continue;
         }
+        if (arg == "--no-cluster") {
+            cfg.clustering_enabled = false;
+            continue;
+        }
+        if (arg == "--sdf-sdf-a2b-only") {
+            cfg.sdf_sdf_a2b_only = true;
+            continue;
+        }
+        if (arg == "--sdf-box-samples-lite") {
+            cfg.sdf_box_samples_lite = true;
+            continue;
+        }
+        if (arg == "--include-nsc-lcp") {
+            cfg.include_nsc_lcp = true;
+            continue;
+        }
 
         std::cerr << "Unknown option: " << arg << std::endl;
         return false;
@@ -343,23 +368,76 @@ bool ParseArgs(int argc, char* argv[], ScaleupConfig& cfg) {
     return true;
 }
 
+std::vector<chrono::ChVector3d> BuildLiteBoxSamples(const chrono::ChVector3d& h) {
+    std::vector<chrono::ChVector3d> samples;
+    samples.reserve(9);
+    samples.push_back(chrono::VNULL);
+    for (int sx : {-1, 1}) {
+        for (int sy : {-1, 1}) {
+            for (int sz : {-1, 1}) {
+                samples.push_back(chrono::ChVector3d(static_cast<double>(sx) * h.x(), static_cast<double>(sy) * h.y(),
+                                                     static_cast<double>(sz) * h.z()));
+            }
+        }
+    }
+    return samples;
+}
+
+enum class P2ContactMode {
+    ChronoBaselineSmc = 0,
+    SdfContactSmc = 1,
+    NscLcpBaseline = 2,
+};
+
+const char* ContactModeName(P2ContactMode mode) {
+    switch (mode) {
+        case P2ContactMode::ChronoBaselineSmc:
+            return "chrono_baseline";
+        case P2ContactMode::SdfContactSmc:
+            return "sdf_contact";
+        case P2ContactMode::NscLcpBaseline:
+            return "nsc_lcp_baseline";
+        default:
+            return "unknown_mode";
+    }
+}
+
 ScaleupResult RunCase(int body_count,
-                      bool use_sdf_contact,
+                      P2ContactMode mode,
                       const ScaleupConfig& cfg,
                       std::vector<TrajectoryRow>* trajectory_rows) {
     using namespace chrono;
     using namespace chrono_sdf_contact;
 
-    ChSystemSMC sys;
-    sys.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
-    sys.SetGravitationalAcceleration(ChVector3d(0.0, -9.81, 0.0));
+    const bool use_sdf_contact = (mode == P2ContactMode::SdfContactSmc);
+    const bool use_nsc_lcp = (mode == P2ContactMode::NscLcpBaseline);
 
-    auto material = chrono_types::make_shared<ChContactMaterialSMC>();
-    material->SetFriction(0.45f);
-    material->SetRestitution(0.0f);
-    material->SetYoungModulus(3.0e6f);
-    material->SetKn(6.0e4f);
-    material->SetGn(240.0f);
+    std::unique_ptr<ChSystem> sys_owner;
+    std::shared_ptr<ChContactMaterial> material;
+    if (use_nsc_lcp) {
+        auto sys_nsc = std::make_unique<ChSystemNSC>();
+        sys_nsc->SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
+        sys_nsc->SetGravitationalAcceleration(ChVector3d(0.0, -9.81, 0.0));
+        sys_nsc->SetSolverType(ChSolver::Type::APGD);
+        auto mat_nsc = chrono_types::make_shared<ChContactMaterialNSC>();
+        mat_nsc->SetFriction(0.45f);
+        mat_nsc->SetRestitution(0.0f);
+        material = mat_nsc;
+        sys_owner = std::move(sys_nsc);
+    } else {
+        auto sys_smc = std::make_unique<ChSystemSMC>();
+        sys_smc->SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
+        sys_smc->SetGravitationalAcceleration(ChVector3d(0.0, -9.81, 0.0));
+        auto mat_smc = chrono_types::make_shared<ChContactMaterialSMC>();
+        mat_smc->SetFriction(0.45f);
+        mat_smc->SetRestitution(0.0f);
+        mat_smc->SetYoungModulus(3.0e6f);
+        mat_smc->SetKn(6.0e4f);
+        mat_smc->SetGn(240.0f);
+        material = mat_smc;
+        sys_owner = std::move(sys_smc);
+    }
+    auto& sys = *sys_owner;
 
     auto ground = chrono_types::make_shared<ChBodyEasyBox>(8.0, 0.2, 8.0, 1000.0, true, true, material);
     ground->SetFixed(true);
@@ -384,9 +462,13 @@ ScaleupResult RunCase(int body_count,
         registry = std::make_shared<SdfRegistry>();
         pair_cache = std::make_shared<SdfPairCache>();
         auto narrowphase = std::make_shared<SdfNarrowphase>();
+        if (cfg.sdf_sdf_a2b_only) {
+            narrowphase->SetSdfSdfSamplingMode(SdfSdfSamplingMode::AtoBOnly);
+        }
         auto clustering = std::make_shared<SdfClustering>(cfg.kmax, cfg.cell_size);
         auto narrow_cb = std::make_shared<SdfNarrowphaseCallback>(registry, pair_cache);
         auto custom_cb = std::make_shared<SdfCustomCollisionCallback>(registry, pair_cache, narrowphase, clustering);
+        custom_cb->SetClusteringEnabled(cfg.clustering_enabled);
 
         SdfProxy ground_proxy;
         ground_proxy.sdf = std::make_shared<PlaneSdfVolume>(0.1);
@@ -421,11 +503,14 @@ ScaleupResult RunCase(int body_count,
             SdfProxy proxy;
             proxy.sdf = std::make_shared<BoxSdfVolume>(half);
             proxy.material = material;
+            if (cfg.sdf_box_samples_lite) {
+                proxy.boundary_samples_local = BuildLiteBoxSamples(half);
+            }
             registry->Register(box->GetCollisionModel().get(), proxy);
         }
     }
 
-    const std::string mode_name = use_sdf_contact ? "sdf_contact" : "chrono_baseline";
+    const std::string mode_name = ContactModeName(mode);
     const int num_steps = std::max(1, static_cast<int>(cfg.duration / cfg.step_size));
     const auto gravity = sys.GetGravitationalAcceleration();
     const double energy0 = ComputeBodiesMechanicalEnergy(bodies, gravity);
@@ -493,6 +578,7 @@ ScaleupResult RunCase(int body_count,
     out.body_count = body_count;
     out.steps = num_steps;
     out.step_size = cfg.step_size;
+    out.clustering_enabled = cfg.clustering_enabled ? 1 : 0;
     out.wall_time_s = std::chrono::duration<double>(t1 - t0).count();
     out.avg_contacts = (num_steps > 0) ? static_cast<double>(total_contacts) / static_cast<double>(num_steps) : 0.0;
     out.max_contacts = max_contacts;
@@ -520,6 +606,7 @@ void PrintResult(const ScaleupResult& r) {
               << ", avg_contacts=" << r.avg_contacts << ", max_contacts=" << r.max_contacts
               << ", max_penetration=" << r.max_penetration
               << ", max_relative_energy_drift=" << r.max_relative_energy_drift
+              << ", clustering=" << r.clustering_enabled
               << ", exploded=" << (r.exploded ? 1 : 0) << std::endl;
 }
 
@@ -528,10 +615,10 @@ void WriteCsv(const std::string& path, const std::vector<ScaleupResult>& rows) {
     if (!out.is_open()) {
         throw std::runtime_error("Failed to open CSV file: " + path);
     }
-    out << "mode,body_count,steps,step_size,wall_time_s,avg_contacts,max_contacts,max_penetration,max_relative_energy_drift,exploded\n";
+    out << "mode,body_count,steps,step_size,clustering_enabled,wall_time_s,avg_contacts,max_contacts,max_penetration,max_relative_energy_drift,exploded\n";
     for (const auto& r : rows) {
-        out << r.mode << "," << r.body_count << "," << r.steps << "," << r.step_size << "," << r.wall_time_s << ","
-            << r.avg_contacts << "," << r.max_contacts << "," << r.max_penetration << "," << r.max_relative_energy_drift
+        out << r.mode << "," << r.body_count << "," << r.steps << "," << r.step_size << "," << r.clustering_enabled
+            << "," << r.wall_time_s << "," << r.avg_contacts << "," << r.max_contacts << "," << r.max_penetration << "," << r.max_relative_energy_drift
             << "," << (r.exploded ? 1 : 0) << "\n";
     }
 }
@@ -546,13 +633,20 @@ int main(int argc, char* argv[]) {
 
     try {
         std::vector<ScaleupResult> results;
-        results.reserve(cfg.body_counts.size() * 2);
+        results.reserve(cfg.body_counts.size() * (cfg.include_nsc_lcp ? 3 : 2));
         std::vector<TrajectoryRow> trajectories;
         for (int body_count : cfg.body_counts) {
             results.push_back(
-                RunCase(body_count, false, cfg, cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
+                RunCase(body_count, P2ContactMode::ChronoBaselineSmc, cfg,
+                        cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
             results.push_back(
-                RunCase(body_count, true, cfg, cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
+                RunCase(body_count, P2ContactMode::SdfContactSmc, cfg,
+                        cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
+            if (cfg.include_nsc_lcp) {
+                results.push_back(
+                    RunCase(body_count, P2ContactMode::NscLcpBaseline, cfg,
+                            cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
+            }
         }
 
         for (const auto& r : results) {

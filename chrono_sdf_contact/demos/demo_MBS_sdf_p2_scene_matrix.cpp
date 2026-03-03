@@ -20,8 +20,11 @@
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChBodyEasy.h"
 #include "chrono/physics/ChContactContainer.h"
+#include "chrono/physics/ChContactMaterialNSC.h"
 #include "chrono/physics/ChContactMaterialSMC.h"
+#include "chrono/physics/ChSystemNSC.h"
 #include "chrono/physics/ChSystemSMC.h"
+#include "chrono/solver/ChSolver.h"
 
 #include "SdfClustering.h"
 #include "SdfCustomCollisionCallback.h"
@@ -260,6 +263,8 @@ struct SceneMatrixConfig {
     bool clustering_enabled = true;
     bool cache_enabled = true;
     bool bound_cull_enabled = true;
+    bool adaptive_stack3_fast = false;
+    bool include_nsc_lcp = false;
     std::uint64_t seed = 42;
 };
 
@@ -336,7 +341,8 @@ void PrintUsage(const char* exe_name) {
     std::cout << "Usage: " << exe_name
               << " [--csv <path>] [--trajectory-csv <path>] [--duration <seconds>] [--dts <h1,h2,...>]"
                  " [--kmax <int>] [--cell-size <meters>]"
-                 " [--seed <u64>] [--no-cluster] [--no-cache] [--no-bound-cull]\n";
+                 " [--seed <u64>] [--no-cluster] [--no-cache] [--no-bound-cull]"
+                 " [--adaptive-stack3-fast] [--include-nsc-lcp]\n";
 }
 
 bool ParseArgs(int argc, char* argv[], SceneMatrixConfig& cfg) {
@@ -444,6 +450,16 @@ bool ParseArgs(int argc, char* argv[], SceneMatrixConfig& cfg) {
             continue;
         }
 
+        if (arg == "--adaptive-stack3-fast") {
+            cfg.adaptive_stack3_fast = true;
+            continue;
+        }
+
+        if (arg == "--include-nsc-lcp") {
+            cfg.include_nsc_lcp = true;
+            continue;
+        }
+
         std::cerr << "Unknown option: " << arg << std::endl;
         return false;
     }
@@ -466,10 +482,29 @@ std::uint64_t BuildSceneSeed(std::uint64_t base_seed, P2SceneId scene, double st
     return base_seed ^ (scene_code * 0x9e3779b97f4a7c15ULL) ^ (dt_code * 0x94d049bb133111ebULL);
 }
 
+enum class P2ContactMode {
+    ChronoBaselineSmc = 0,
+    SdfContactSmc = 1,
+    NscLcpBaseline = 2,
+};
+
+const char* ContactModeName(P2ContactMode mode) {
+    switch (mode) {
+        case P2ContactMode::ChronoBaselineSmc:
+            return "chrono_baseline";
+        case P2ContactMode::SdfContactSmc:
+            return "sdf_contact";
+        case P2ContactMode::NscLcpBaseline:
+            return "nsc_lcp_baseline";
+        default:
+            return "unknown_mode";
+    }
+}
+
 void BuildSceneBodies(P2SceneId scene,
                       std::uint64_t seed,
-                      std::shared_ptr<chrono::ChContactMaterialSMC> material,
-                      chrono::ChSystemSMC& sys,
+                      std::shared_ptr<chrono::ChContactMaterial> material,
+                      chrono::ChSystem& sys,
                       std::vector<DynamicBodySpec>& out_dynamic) {
     using namespace chrono;
     using namespace chrono_sdf_contact;
@@ -539,23 +574,45 @@ void BuildSceneBodies(P2SceneId scene,
 }
 
 RunResult RunCase(P2SceneId scene,
-                  bool use_sdf_contact,
+                  P2ContactMode mode,
                   double step_size,
                   const SceneMatrixConfig& cfg,
                   std::vector<TrajectoryRow>* trajectory_rows) {
     using namespace chrono;
     using namespace chrono_sdf_contact;
 
-    ChSystemSMC sys;
-    sys.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
-    sys.SetGravitationalAcceleration(ChVector3d(0.0, -9.81, 0.0));
+    const bool use_sdf_contact = (mode == P2ContactMode::SdfContactSmc);
+    const bool use_nsc_lcp = (mode == P2ContactMode::NscLcpBaseline);
+    const bool clustering_enabled_run =
+        use_sdf_contact ? (!(cfg.adaptive_stack3_fast && scene == P2SceneId::Stack3) && cfg.clustering_enabled)
+                        : cfg.clustering_enabled;
 
-    auto material = chrono_types::make_shared<ChContactMaterialSMC>();
-    material->SetFriction(0.45f);
-    material->SetRestitution(0.0f);
-    material->SetYoungModulus(3.0e6f);
-    material->SetKn(6.0e4f);
-    material->SetGn(240.0f);
+    std::unique_ptr<ChSystem> sys_owner;
+    std::shared_ptr<ChContactMaterial> material;
+    if (use_nsc_lcp) {
+        auto sys_nsc = std::make_unique<ChSystemNSC>();
+        sys_nsc->SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
+        sys_nsc->SetGravitationalAcceleration(ChVector3d(0.0, -9.81, 0.0));
+        sys_nsc->SetSolverType(ChSolver::Type::APGD);
+        auto mat_nsc = chrono_types::make_shared<ChContactMaterialNSC>();
+        mat_nsc->SetFriction(0.45f);
+        mat_nsc->SetRestitution(0.0f);
+        material = mat_nsc;
+        sys_owner = std::move(sys_nsc);
+    } else {
+        auto sys_smc = std::make_unique<ChSystemSMC>();
+        sys_smc->SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
+        sys_smc->SetGravitationalAcceleration(ChVector3d(0.0, -9.81, 0.0));
+        auto mat_smc = chrono_types::make_shared<ChContactMaterialSMC>();
+        mat_smc->SetFriction(0.45f);
+        mat_smc->SetRestitution(0.0f);
+        mat_smc->SetYoungModulus(3.0e6f);
+        mat_smc->SetKn(6.0e4f);
+        mat_smc->SetGn(240.0f);
+        material = mat_smc;
+        sys_owner = std::move(sys_smc);
+    }
+    auto& sys = *sys_owner;
 
     auto ground = chrono_types::make_shared<ChBodyEasyBox>(6.0, 0.2, 6.0, 1000.0, true, true, material);
     ground->SetFixed(true);
@@ -575,7 +632,7 @@ RunResult RunCase(P2SceneId scene,
         auto clustering = std::make_shared<SdfClustering>(cfg.kmax, cfg.cell_size);
         auto narrow_cb = std::make_shared<SdfNarrowphaseCallback>(registry, pair_cache);
         auto custom_cb = std::make_shared<SdfCustomCollisionCallback>(registry, pair_cache, narrowphase, clustering);
-        custom_cb->SetClusteringEnabled(cfg.clustering_enabled);
+        custom_cb->SetClusteringEnabled(clustering_enabled_run);
 
         SdfProxy ground_proxy;
         ground_proxy.sdf = std::make_shared<PlaneSdfVolume>(0.1);
@@ -603,7 +660,7 @@ RunResult RunCase(P2SceneId scene,
     }
 
     const std::string scene_name = SceneName(scene);
-    const std::string mode_name = use_sdf_contact ? "sdf_contact" : "chrono_baseline";
+    const std::string mode_name = ContactModeName(mode);
     auto reporter = std::make_shared<MinDistanceReporter>();
     double min_dist = std::numeric_limits<double>::infinity();
     double min_height = std::numeric_limits<double>::infinity();
@@ -682,7 +739,7 @@ RunResult RunCase(P2SceneId scene,
     out.step_size = step_size;
     out.steps = num_steps;
     out.dynamic_body_count = static_cast<int>(dynamic_bodies.size());
-    out.clustering_enabled = cfg.clustering_enabled ? 1 : 0;
+    out.clustering_enabled = clustering_enabled_run ? 1 : 0;
     out.cache_enabled = cfg.cache_enabled ? 1 : 0;
     out.bound_cull_enabled = cfg.bound_cull_enabled ? 1 : 0;
     out.wall_time_s = std::chrono::duration<double>(t1 - t0).count();
@@ -754,9 +811,16 @@ int main(int argc, char* argv[]) {
         for (double dt : cfg.step_sizes) {
             for (auto scene : scenes) {
                 results.push_back(
-                    RunCase(scene, false, dt, cfg, cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
+                    RunCase(scene, P2ContactMode::ChronoBaselineSmc, dt, cfg,
+                            cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
                 results.push_back(
-                    RunCase(scene, true, dt, cfg, cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
+                    RunCase(scene, P2ContactMode::SdfContactSmc, dt, cfg,
+                            cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
+                if (cfg.include_nsc_lcp) {
+                    results.push_back(
+                        RunCase(scene, P2ContactMode::NscLcpBaseline, dt, cfg,
+                                cfg.trajectory_csv_path.empty() ? nullptr : &trajectories));
+                }
             }
         }
 

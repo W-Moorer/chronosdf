@@ -71,7 +71,10 @@ def plot_scene_matrix(scene_rows, out_dir):
     axes_pen = axes_pen.flatten() if hasattr(axes_pen, "flatten") else [axes_pen]
     axes_wall = axes_wall.flatten() if hasattr(axes_wall, "flatten") else [axes_wall]
 
-    mode_order = ["chrono_baseline", "sdf_contact"]
+    preferred_mode_order = ["chrono_baseline", "nsc_lcp_baseline", "sdf_contact"]
+    detected_modes = sorted(set(r["mode"] for r in agg))
+    mode_order = [m for m in preferred_mode_order if m in detected_modes]
+    mode_order.extend([m for m in detected_modes if m not in mode_order])
 
     for i, scene in enumerate(scenes):
         ax_pen = axes_pen[i]

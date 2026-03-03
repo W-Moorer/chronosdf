@@ -500,94 +500,116 @@ def p2_scene_section(scene_rows, sig_samples=2000, sig_seed=12345):
     lines.append("")
     lines.append(f"- covered scenes: `{len(scene_names)}` -> {', '.join(scene_names)}")
 
+    available_modes = sorted({r.get("mode", "") for r in scene_rows if r.get("mode", "")})
+    preferred_modes = ["chrono_baseline", "nsc_lcp_baseline", "sdf_contact"]
+    ordered_modes = [m for m in preferred_modes if m in available_modes]
+    ordered_modes.extend([m for m in available_modes if m not in ordered_modes])
+    mode_pairs = []
+    if len(ordered_modes) >= 2:
+        for i in range(len(ordered_modes)):
+            for j in range(i + 1, len(ordered_modes)):
+                mode_pairs.append((ordered_modes[i], ordered_modes[j]))
+
     lines.append("")
     lines.append(f"Significance checks (permutation test, two-sided, samples={sig_samples}):")
     lines.append("")
-    lines.append("| scope | metric | chrono_baseline_mean | sdf_contact_mean | delta(sdf-baseline) | p_value |")
-    lines.append("| --- | --- | ---: | ---: | ---: | ---: |")
+    lines.append("| scope | metric | mode_a | mode_b | mode_a_mean | mode_b_mean | delta(b-a) | p_value |")
+    lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: |")
 
     def metric_vals(rows, mode, metric):
         return [to_float(r, metric) for r in rows if r.get("mode", "") == mode]
 
-    for metric in ["wall_time_s", "max_penetration", "exploded"]:
-        b_vals = metric_vals(scene_rows, "chrono_baseline", metric)
-        s_vals = metric_vals(scene_rows, "sdf_contact", metric)
-        b_mean = mean(b_vals)
-        s_mean = mean(s_vals)
-        p = permutation_pvalue(b_vals, s_vals, samples=sig_samples, seed=sig_seed + 101 + len(metric))
-        lines.append(
-            "| all-scenes | {metric} | {bm} | {sm} | {delta} | {p} |".format(
-                metric=metric,
-                bm=fmt(b_mean),
-                sm=fmt(s_mean),
-                delta=fmt((s_mean - b_mean) if (s_mean is not None and b_mean is not None) else None),
-                p=fmt(p),
+    for mode_a, mode_b in mode_pairs:
+        pair_code = sum(ord(ch) for ch in (mode_a + "|" + mode_b))
+        for metric in ["wall_time_s", "max_penetration", "exploded"]:
+            a_vals = metric_vals(scene_rows, mode_a, metric)
+            b_vals = metric_vals(scene_rows, mode_b, metric)
+            a_mean = mean(a_vals)
+            b_mean = mean(b_vals)
+            p = permutation_pvalue(a_vals, b_vals, samples=sig_samples, seed=sig_seed + 101 + pair_code + len(metric))
+            lines.append(
+                "| all-scenes | {metric} | {ma} | {mb} | {am} | {bm} | {delta} | {p} |".format(
+                    metric=metric,
+                    ma=mode_a,
+                    mb=mode_b,
+                    am=fmt(a_mean),
+                    bm=fmt(b_mean),
+                    delta=fmt((b_mean - a_mean) if (b_mean is not None and a_mean is not None) else None),
+                    p=fmt(p),
+                )
             )
-        )
 
-    for scene in scene_names:
-        scene_subset = [r for r in scene_rows if r.get("scene", "") == scene]
-        b_vals = metric_vals(scene_subset, "chrono_baseline", "wall_time_s")
-        s_vals = metric_vals(scene_subset, "sdf_contact", "wall_time_s")
-        b_mean = mean(b_vals)
-        s_mean = mean(s_vals)
-        p = permutation_pvalue(b_vals, s_vals, samples=sig_samples, seed=sig_seed + 211 + len(scene))
-        lines.append(
-            "| {scene} | wall_time_s | {bm} | {sm} | {delta} | {p} |".format(
-                scene=scene,
-                bm=fmt(b_mean),
-                sm=fmt(s_mean),
-                delta=fmt((s_mean - b_mean) if (s_mean is not None and b_mean is not None) else None),
-                p=fmt(p),
+    for mode_a, mode_b in mode_pairs:
+        pair_code = sum(ord(ch) for ch in (mode_a + "|" + mode_b))
+        for scene in scene_names:
+            scene_subset = [r for r in scene_rows if r.get("scene", "") == scene]
+            a_vals = metric_vals(scene_subset, mode_a, "wall_time_s")
+            b_vals = metric_vals(scene_subset, mode_b, "wall_time_s")
+            a_mean = mean(a_vals)
+            b_mean = mean(b_vals)
+            p = permutation_pvalue(a_vals, b_vals, samples=sig_samples, seed=sig_seed + 211 + len(scene) + pair_code)
+            lines.append(
+                "| {scene} | wall_time_s | {ma} | {mb} | {am} | {bm} | {delta} | {p} |".format(
+                    scene=scene,
+                    ma=mode_a,
+                    mb=mode_b,
+                    am=fmt(a_mean),
+                    bm=fmt(b_mean),
+                    delta=fmt((b_mean - a_mean) if (b_mean is not None and a_mean is not None) else None),
+                    p=fmt(p),
+                )
             )
-        )
 
     lines.append("")
     lines.append(f"Exploded significance by scene-step (permutation test, two-sided, samples={sig_samples}):")
     lines.append("")
     lines.append(
-        "| scene | step_size | n_baseline | n_sdf | chrono_baseline_exploded_rate | "
-        "sdf_contact_exploded_rate | delta(sdf-baseline) | p_value |"
+        "| scene | step_size | mode_a | mode_b | n_a | n_b | exploded_rate_a | "
+        "exploded_rate_b | delta(b-a) | p_value |"
     )
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
 
     scene_dt_pairs = sorted(
         {(r.get("scene", ""), to_float(r, "step_size")) for r in scene_rows},
         key=lambda x: (x[0], x[1]),
     )
-    for scene, dt in scene_dt_pairs:
-        subset = [
-            r
-            for r in scene_rows
-            if r.get("scene", "") == scene and abs(to_float(r, "step_size") - dt) < 1e-12
-        ]
-        b_vals = metric_vals(subset, "chrono_baseline", "exploded")
-        s_vals = metric_vals(subset, "sdf_contact", "exploded")
-        b_mean = mean(b_vals)
-        s_mean = mean(s_vals)
-        scene_code = sum(ord(ch) for ch in scene)
-        dt_code = int(round(dt * 1e6))
-        p = permutation_pvalue(
-            b_vals,
-            s_vals,
-            samples=sig_samples,
-            seed=sig_seed + 503 + scene_code * 17 + dt_code,
-        )
-        b_rate = (f"{fmt(100.0 * b_mean, 4)}%" if b_mean is not None else "-")
-        s_rate = (f"{fmt(100.0 * s_mean, 4)}%" if s_mean is not None else "-")
-        delta = (f"{fmt(100.0 * (s_mean - b_mean), 4)}%" if (s_mean is not None and b_mean is not None) else "-")
-        lines.append(
-            "| {scene} | {dt} | {nb} | {ns} | {br} | {sr} | {delta} | {p} |".format(
-                scene=scene,
-                dt=fmt(dt),
-                nb=len(b_vals),
-                ns=len(s_vals),
-                br=b_rate,
-                sr=s_rate,
-                delta=delta,
-                p=fmt(p),
+    for mode_a, mode_b in mode_pairs:
+        pair_code = sum(ord(ch) for ch in (mode_a + "|" + mode_b))
+        for scene, dt in scene_dt_pairs:
+            subset = [
+                r
+                for r in scene_rows
+                if r.get("scene", "") == scene and abs(to_float(r, "step_size") - dt) < 1e-12
+            ]
+            a_vals = metric_vals(subset, mode_a, "exploded")
+            b_vals = metric_vals(subset, mode_b, "exploded")
+            a_mean = mean(a_vals)
+            b_mean = mean(b_vals)
+            scene_code = sum(ord(ch) for ch in scene)
+            dt_code = int(round(dt * 1e6))
+            p = permutation_pvalue(
+                a_vals,
+                b_vals,
+                samples=sig_samples,
+                seed=sig_seed + 503 + scene_code * 17 + dt_code + pair_code,
             )
-        )
+            a_rate = (f"{fmt(100.0 * a_mean, 4)}%" if a_mean is not None else "-")
+            b_rate = (f"{fmt(100.0 * b_mean, 4)}%" if b_mean is not None else "-")
+            delta = (f"{fmt(100.0 * (b_mean - a_mean), 4)}%" if (b_mean is not None and a_mean is not None) else "-")
+            lines.append(
+                "| {scene} | {dt} | {ma} | {mb} | {na} | {nb} | {ar} | {br} | {delta} | {p} |".format(
+                    scene=scene,
+                    dt=fmt(dt),
+                    ma=mode_a,
+                    mb=mode_b,
+                    na=len(a_vals),
+                    nb=len(b_vals),
+                    ar=a_rate,
+                    br=b_rate,
+                    delta=delta,
+                    p=fmt(p),
+                )
+            )
     lines.append("")
     return lines
 
@@ -661,48 +683,66 @@ def p2_scale_section(scale_rows, sig_samples=2000, sig_seed=12345):
         else:
             lines.append(f"| {mode} | - | - | - | - |")
 
+    available_modes = sorted({r.get("mode", "") for r in scale_rows if r.get("mode", "")})
+    preferred_modes = ["chrono_baseline", "nsc_lcp_baseline", "sdf_contact"]
+    ordered_modes = [m for m in preferred_modes if m in available_modes]
+    ordered_modes.extend([m for m in available_modes if m not in ordered_modes])
+    mode_pairs = []
+    if len(ordered_modes) >= 2:
+        for i in range(len(ordered_modes)):
+            for j in range(i + 1, len(ordered_modes)):
+                mode_pairs.append((ordered_modes[i], ordered_modes[j]))
+
     lines.append("")
     lines.append(f"Significance checks (permutation test, two-sided, samples={sig_samples}):")
     lines.append("")
-    lines.append("| scope | metric | chrono_baseline_mean | sdf_contact_mean | delta(sdf-baseline) | p_value |")
-    lines.append("| --- | --- | ---: | ---: | ---: | ---: |")
+    lines.append("| scope | metric | mode_a | mode_b | mode_a_mean | mode_b_mean | delta(b-a) | p_value |")
+    lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: |")
 
     def metric_vals(rows, mode, metric):
         return [to_float(r, metric) for r in rows if r.get("mode", "") == mode]
 
-    for metric in ["wall_time_s", "max_penetration", "exploded"]:
-        b_vals = metric_vals(scale_rows, "chrono_baseline", metric)
-        s_vals = metric_vals(scale_rows, "sdf_contact", metric)
-        b_mean = mean(b_vals)
-        s_mean = mean(s_vals)
-        p = permutation_pvalue(b_vals, s_vals, samples=sig_samples, seed=sig_seed + 307 + len(metric))
-        lines.append(
-            "| all-body-counts | {metric} | {bm} | {sm} | {delta} | {p} |".format(
-                metric=metric,
-                bm=fmt(b_mean),
-                sm=fmt(s_mean),
-                delta=fmt((s_mean - b_mean) if (s_mean is not None and b_mean is not None) else None),
-                p=fmt(p),
+    for mode_a, mode_b in mode_pairs:
+        pair_code = sum(ord(ch) for ch in (mode_a + "|" + mode_b))
+        for metric in ["wall_time_s", "max_penetration", "exploded"]:
+            a_vals = metric_vals(scale_rows, mode_a, metric)
+            b_vals = metric_vals(scale_rows, mode_b, metric)
+            a_mean = mean(a_vals)
+            b_mean = mean(b_vals)
+            p = permutation_pvalue(a_vals, b_vals, samples=sig_samples, seed=sig_seed + 307 + len(metric) + pair_code)
+            lines.append(
+                "| all-body-counts | {metric} | {ma} | {mb} | {am} | {bm} | {delta} | {p} |".format(
+                    metric=metric,
+                    ma=mode_a,
+                    mb=mode_b,
+                    am=fmt(a_mean),
+                    bm=fmt(b_mean),
+                    delta=fmt((b_mean - a_mean) if (b_mean is not None and a_mean is not None) else None),
+                    p=fmt(p),
+                )
             )
-        )
 
     counts = sorted({to_int(r, "body_count", 0) for r in scale_rows if to_int(r, "body_count", 0) > 0})
-    for count in counts:
-        subset = [r for r in scale_rows if to_int(r, "body_count", 0) == count]
-        b_vals = metric_vals(subset, "chrono_baseline", "wall_time_s")
-        s_vals = metric_vals(subset, "sdf_contact", "wall_time_s")
-        b_mean = mean(b_vals)
-        s_mean = mean(s_vals)
-        p = permutation_pvalue(b_vals, s_vals, samples=sig_samples, seed=sig_seed + 401 + count)
-        lines.append(
-            "| body_count={count} | wall_time_s | {bm} | {sm} | {delta} | {p} |".format(
-                count=count,
-                bm=fmt(b_mean),
-                sm=fmt(s_mean),
-                delta=fmt((s_mean - b_mean) if (s_mean is not None and b_mean is not None) else None),
-                p=fmt(p),
+    for mode_a, mode_b in mode_pairs:
+        pair_code = sum(ord(ch) for ch in (mode_a + "|" + mode_b))
+        for count in counts:
+            subset = [r for r in scale_rows if to_int(r, "body_count", 0) == count]
+            a_vals = metric_vals(subset, mode_a, "wall_time_s")
+            b_vals = metric_vals(subset, mode_b, "wall_time_s")
+            a_mean = mean(a_vals)
+            b_mean = mean(b_vals)
+            p = permutation_pvalue(a_vals, b_vals, samples=sig_samples, seed=sig_seed + 401 + count + pair_code)
+            lines.append(
+                "| body_count={count} | wall_time_s | {ma} | {mb} | {am} | {bm} | {delta} | {p} |".format(
+                    count=count,
+                    ma=mode_a,
+                    mb=mode_b,
+                    am=fmt(a_mean),
+                    bm=fmt(b_mean),
+                    delta=fmt((b_mean - a_mean) if (b_mean is not None and a_mean is not None) else None),
+                    p=fmt(p),
+                )
             )
-        )
 
     lines.append("")
     return lines
